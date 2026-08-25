@@ -1,0 +1,28 @@
+{
+  "name": "chazybazy-watchface",
+  "author": "Chazybazy",
+  "version": "1.0.0",
+  "keywords": [
+    "pebble-app"
+  ],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Chazybazy's Watchface",
+    "uuid": "8d9372ad-b4c1-459c-9f25-a4ae50244eb2",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": true
+    },
+    "messageKeys": [
+      "dummy"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}
