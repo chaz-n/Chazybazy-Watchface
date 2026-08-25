@@ -16,6 +16,7 @@
 #define DATE_TEXT_LIFT 5
 
 #define SECOND_ANIM_DURATION 500
+#define MINUTE_ANIM_DURATION 500
 
 static Window *s_window;
 static Layer *s_face_layer;
@@ -25,10 +26,15 @@ static char s_date_buffer[12];
 static GPoint s_center;
 static int16_t s_rx, s_ry;
 
-// Second hand angle, driven by the bounce animation rather than read straight
-// off the clock. Offset by a full turn so it never goes negative mid-bounce.
+// Hand angles are driven by the bounce animation rather than read straight off
+// the clock. Each is offset by a full turn so it never goes negative mid-bounce.
 static int32_t s_second_from, s_second_to, s_second_angle;
+static int32_t s_minute_from, s_minute_to, s_minute_angle;
+static int32_t s_hour_from, s_hour_to, s_hour_angle;
 static Animation *s_second_anim;
+// The minute and hour hands step together once a minute, so one animation
+// drives both.
+static Animation *s_minute_anim;
 
 static const char *const s_numerals[] = {
   "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"
@@ -169,15 +175,9 @@ static void prv_face_update_proc(Layer *layer, GContext *ctx) {
   prv_draw_ticks(ctx);
   prv_draw_numerals(ctx);
 
-  const time_t now = time(NULL);
-  const struct tm *t = localtime(&now);
-
-  const int32_t minute_angle = TRIG_MAX_ANGLE * t->tm_min / 60;
-  const int32_t hour_angle = TRIG_MAX_ANGLE * ((t->tm_hour % 12) * 60 + t->tm_min) / (12 * 60);
-
   prv_draw_date(ctx);
-  prv_draw_hand(ctx, hour_angle, HAND_MARGIN_HOUR, 9, GColorWhite, false);
-  prv_draw_hand(ctx, minute_angle, HAND_MARGIN_MINUTE, 7, GColorWhite, false);
+  prv_draw_hand(ctx, s_hour_angle, HAND_MARGIN_HOUR, 9, GColorWhite, false);
+  prv_draw_hand(ctx, s_minute_angle, HAND_MARGIN_MINUTE, 7, GColorWhite, false);
   prv_draw_hand(ctx, s_second_angle, HAND_MARGIN_SECOND, 2,
                 PBL_IF_COLOR_ELSE(GColorRed, GColorWhite), true);
 
@@ -211,27 +211,62 @@ static AnimationProgress prv_bounce_curve(AnimationProgress linear) {
   return (AnimationProgress)(f < 0 ? 0 : f);
 }
 
-static void prv_anim_update(Animation *anim, const AnimationProgress progress) {
-  s_second_angle = s_second_from +
-      (int32_t)((int64_t)(s_second_to - s_second_from) * progress / ANIMATION_NORMALIZED_MAX);
+static int32_t prv_lerp(int32_t from, int32_t to, AnimationProgress progress) {
+  return from + (int32_t)((int64_t)(to - from) * progress / ANIMATION_NORMALIZED_MAX);
+}
+
+static void prv_second_update(Animation *anim, const AnimationProgress progress) {
+  s_second_angle = prv_lerp(s_second_from, s_second_to, progress);
+  layer_mark_dirty(s_face_layer);
+}
+
+// Minute and hour move off the same progress, so the hour hand creeps forward
+// in step with the minute hand instead of snapping a moment later.
+static void prv_minute_update(Animation *anim, const AnimationProgress progress) {
+  s_minute_angle = prv_lerp(s_minute_from, s_minute_to, progress);
+  s_hour_angle = prv_lerp(s_hour_from, s_hour_to, progress);
   layer_mark_dirty(s_face_layer);
 }
 
 static const AnimationImplementation s_second_impl = {
-  .update = prv_anim_update,
+  .update = prv_second_update,
 };
+
+static const AnimationImplementation s_minute_impl = {
+  .update = prv_minute_update,
+};
+
+// Replaces whatever is in `slot`, so a tick arriving mid-bounce restarts that
+// hand cleanly rather than leaking the old animation.
+static void prv_schedule(Animation **slot, const AnimationImplementation *impl,
+                         uint32_t duration) {
+  if (*slot) {
+    animation_unschedule(*slot);
+    animation_destroy(*slot);
+  }
+  *slot = animation_create();
+  animation_set_duration(*slot, duration);
+  animation_set_custom_curve(*slot, prv_bounce_curve);
+  animation_set_implementation(*slot, impl);
+  animation_schedule(*slot);
+}
 
 static void prv_animate_second(int seconds) {
   // The extra full turn keeps every angle positive across the 59 -> 0 wrap.
   s_second_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * seconds / 60;
   s_second_from = s_second_to - TRIG_MAX_ANGLE / 60;
 
-  animation_unschedule_all();
-  s_second_anim = animation_create();
-  animation_set_duration(s_second_anim, SECOND_ANIM_DURATION);
-  animation_set_custom_curve(s_second_anim, prv_bounce_curve);
-  animation_set_implementation(s_second_anim, &s_second_impl);
-  animation_schedule(s_second_anim);
+  prv_schedule(&s_second_anim, &s_second_impl, SECOND_ANIM_DURATION);
+}
+
+static void prv_animate_minute(int hours, int minutes) {
+  s_minute_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * minutes / 60;
+  s_minute_from = s_minute_to - TRIG_MAX_ANGLE / 60;
+
+  s_hour_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * ((hours % 12) * 60 + minutes) / (12 * 60);
+  s_hour_from = s_hour_to - TRIG_MAX_ANGLE / (12 * 60);
+
+  prv_schedule(&s_minute_anim, &s_minute_impl, MINUTE_ANIM_DURATION);
 }
 
 static void prv_update_date(const struct tm *t) {
@@ -248,6 +283,9 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   if (units_changed & DAY_UNIT) {
     prv_update_date(tick_time);
   }
+  if (units_changed & MINUTE_UNIT) {
+    prv_animate_minute(tick_time->tm_hour, tick_time->tm_min);
+  }
   prv_animate_second(tick_time->tm_sec);
 }
 
@@ -263,11 +301,22 @@ static void prv_window_load(Window *window) {
   const time_t now = time(NULL);
   const struct tm *t = localtime(&now);
   prv_update_date(t);
+  // Start settled on the current time; the animations take over from the next tick.
   s_second_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_sec / 60;
+  s_minute_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_min / 60;
+  s_hour_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * ((t->tm_hour % 12) * 60 + t->tm_min) / (12 * 60);
 }
 
 static void prv_window_unload(Window *window) {
   animation_unschedule_all();
+  if (s_second_anim) {
+    animation_destroy(s_second_anim);
+    s_second_anim = NULL;
+  }
+  if (s_minute_anim) {
+    animation_destroy(s_minute_anim);
+    s_minute_anim = NULL;
+  }
   layer_destroy(s_face_layer);
 }
 

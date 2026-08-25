@@ -2,7 +2,7 @@
 
 A Pebble watchapp/watchface written in C using the Pebble SDK.
 
-![til](./screenshots/emery_1.0.0_20260825-200206.gif)
+![til](./screenshots/emery_1.0.1_20260825-203352.gif)
 
 ## Building & running
 
