@@ -1,6 +1,8 @@
-# myproject
+# Chazybazy's Watchface 
 
 A Pebble watchapp/watchface written in C using the Pebble SDK.
+
+![til](./screenshots/emery_1.0.0_20260825-200206.gif)
 
 ## Building & running
 
