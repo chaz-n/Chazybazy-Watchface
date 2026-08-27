@@ -18,6 +18,23 @@
 #define SECOND_ANIM_DURATION 500
 #define MINUTE_ANIM_DURATION 500
 
+// The second hand is the only expensive thing on this face: drawing it means a
+// SECOND_UNIT tick plus a 30fps bounce every second, where the rest of the dial
+// only needs waking once a minute. The mode chooses when to pay for it.
+typedef enum {
+  SecondHandModeAlways = 0,
+  SecondHandModeBacklight = 1,
+  SecondHandModeNever = 2,
+} SecondHandMode;
+
+#define SECOND_MODE_DEFAULT SecondHandModeAlways
+#define PERSIST_KEY_SECOND_MODE 1
+
+// A watchface is never told whether the backlight is lit, so the shake that
+// lights it is what we listen for instead, and the hand stays up for roughly as
+// long as the backlight does.
+#define BACKLIGHT_WINDOW_MS 5000
+
 static Window *s_window;
 static Layer *s_face_layer;
 static char s_date_buffer[12];
@@ -35,6 +52,11 @@ static Animation *s_second_anim;
 // The minute and hour hands step together once a minute, so one animation
 // drives both.
 static Animation *s_minute_anim;
+
+// Whether the second hand is on screen right now. In backlight mode this goes
+// up and down with the wrist; in the other two modes it is fixed.
+static bool s_second_visible = true;
+static AppTimer *s_backlight_timer;
 
 static const char *const s_numerals[] = {
   "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"
@@ -178,8 +200,10 @@ static void prv_face_update_proc(Layer *layer, GContext *ctx) {
   prv_draw_date(ctx);
   prv_draw_hand(ctx, s_hour_angle, HAND_MARGIN_HOUR, 9, GColorWhite, false);
   prv_draw_hand(ctx, s_minute_angle, HAND_MARGIN_MINUTE, 7, GColorWhite, false);
-  prv_draw_hand(ctx, s_second_angle, HAND_MARGIN_SECOND, 2,
-                PBL_IF_COLOR_ELSE(GColorRed, GColorWhite), true);
+  if (s_second_visible) {
+    prv_draw_hand(ctx, s_second_angle, HAND_MARGIN_SECOND, 2,
+                  PBL_IF_COLOR_ELSE(GColorRed, GColorWhite), true);
+  }
 
   // Center cap
   graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorWhite));
@@ -286,7 +310,69 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   if (units_changed & MINUTE_UNIT) {
     prv_animate_minute(tick_time->tm_hour, tick_time->tm_min);
   }
-  prv_animate_second(tick_time->tm_sec);
+  if (s_second_visible) {
+    prv_animate_second(tick_time->tm_sec);
+  }
+}
+
+// Puts the second hand at the current second without animating, for when it
+// reappears partway through a minute.
+static void prv_sync_second_angle(void) {
+  const time_t now = time(NULL);
+  const struct tm *t = localtime(&now);
+  s_second_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_sec / 60;
+}
+
+// Shows or hides the second hand, moving the tick subscription with it: the
+// watch is only woken every second while the hand is actually on screen.
+static void prv_set_second_visible(bool visible) {
+  s_second_visible = visible;
+
+  if (visible) {
+    prv_sync_second_angle();
+    tick_timer_service_subscribe(SECOND_UNIT, prv_tick_handler);
+  } else {
+    tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
+    if (s_second_anim) {
+      animation_unschedule(s_second_anim);
+    }
+  }
+  layer_mark_dirty(s_face_layer);
+}
+
+static void prv_backlight_timeout(void *context) {
+  s_backlight_timer = NULL;
+  prv_set_second_visible(false);
+}
+
+// A flick of the wrist is what lights the backlight, so it is also what brings
+// the second hand up. Another flick before the window is out just extends it.
+static void prv_tap_handler(AccelAxisType axis, int32_t direction) {
+  if (!s_second_visible) {
+    prv_set_second_visible(true);
+  }
+  if (s_backlight_timer) {
+    app_timer_reschedule(s_backlight_timer, BACKLIGHT_WINDOW_MS);
+  } else {
+    s_backlight_timer = app_timer_register(BACKLIGHT_WINDOW_MS, prv_backlight_timeout, NULL);
+  }
+}
+
+// Applies a mode from scratch: tears down whatever the last one had running,
+// then subscribes only to what this one needs. Safe to call repeatedly.
+static void prv_apply_second_mode(SecondHandMode mode) {
+  if (s_backlight_timer) {
+    app_timer_cancel(s_backlight_timer);
+    s_backlight_timer = NULL;
+  }
+  // The accelerometer costs power of its own, so it is only on in the one mode
+  // that reads it.
+  accel_tap_service_unsubscribe();
+  if (mode == SecondHandModeBacklight) {
+    accel_tap_service_subscribe(prv_tap_handler);
+  }
+
+  prv_set_second_visible(mode == SecondHandModeAlways);
 }
 
 static void prv_window_load(Window *window) {
@@ -320,6 +406,43 @@ static void prv_window_unload(Window *window) {
   layer_destroy(s_face_layer);
 }
 
+// Clay sends a radiogroup selection as a string, but a hand-rolled config page
+// or a future Clay release could send a plain number, so take either.
+static int32_t prv_tuple_int(const Tuple *t) {
+  if (t->type == TUPLE_CSTRING) {
+    return atoi(t->value->cstring);
+  }
+  switch (t->length) {
+    case 1: return t->value->int8;
+    case 2: return t->value->int16;
+    default: return t->value->int32;
+  }
+}
+
+static SecondHandMode prv_clamp_mode(int32_t value) {
+  if (value < SecondHandModeAlways || value > SecondHandModeNever) {
+    return SECOND_MODE_DEFAULT;
+  }
+  return (SecondHandMode)value;
+}
+
+static void prv_inbox_received(DictionaryIterator *iter, void *context) {
+  const Tuple *t = dict_find(iter, MESSAGE_KEY_SecondHandMode);
+  if (!t) {
+    return;
+  }
+  const SecondHandMode mode = prv_clamp_mode(prv_tuple_int(t));
+  persist_write_int(PERSIST_KEY_SECOND_MODE, mode);
+  prv_apply_second_mode(mode);
+}
+
+static SecondHandMode prv_load_second_mode(void) {
+  if (!persist_exists(PERSIST_KEY_SECOND_MODE)) {
+    return SECOND_MODE_DEFAULT;
+  }
+  return prv_clamp_mode(persist_read_int(PERSIST_KEY_SECOND_MODE));
+}
+
 static void prv_init(void) {
   s_window = window_create();
   window_set_background_color(s_window, GColorBlack);
@@ -329,10 +452,19 @@ static void prv_init(void) {
   });
   window_stack_push(s_window, true);
 
-  tick_timer_service_subscribe(SECOND_UNIT, prv_tick_handler);
+  // Subscribes the tick service too, at whatever rate the mode calls for.
+  prv_apply_second_mode(prv_load_second_mode());
+
+  app_message_register_inbox_received(prv_inbox_received);
+  app_message_open(64, 64);
 }
 
 static void prv_deinit(void) {
+  if (s_backlight_timer) {
+    app_timer_cancel(s_backlight_timer);
+    s_backlight_timer = NULL;
+  }
+  accel_tap_service_unsubscribe();
   tick_timer_service_unsubscribe();
   window_destroy(s_window);
 }

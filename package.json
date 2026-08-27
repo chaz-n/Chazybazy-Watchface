@@ -6,7 +6,9 @@
     "pebble-app"
   ],
   "private": true,
-  "dependencies": {},
+  "dependencies": {
+    "pebble-clay": "^1.0.4"
+  },
   "pebble": {
     "displayName": "Chazybazy's Watchface",
     "uuid": "8d9372ad-b4c1-459c-9f25-a4ae50244eb2",
@@ -19,7 +21,7 @@
       "watchface": true
     },
     "messageKeys": [
-      "dummy"
+      "SecondHandMode"
     ],
     "resources": {
       "media": []

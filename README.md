@@ -4,6 +4,25 @@ A Pebble watchapp/watchface written in C using the Pebble SDK.
 
 ![til](./screenshots/emery_1.0.1_20260825-203352.gif)
 
+## Settings
+
+The watchface has a settings page (Clay), reachable from the watchface list in
+the Pebble mobile app. It offers one choice, the second hand:
+
+| Mode | Behaviour | Cost |
+| --- | --- | --- |
+| **Always on** (default) | The second hand sweeps continuously. | The watch wakes every second and animates at 30fps. |
+| **Only when the backlight is on** | The hand appears on a wrist flick and hides again after five seconds. | Per-second wakes only during those few seconds; the accelerometer stays on. |
+| **Off** | No second hand. | The face wakes once a minute. |
+
+The SDK gives a watchface no way to read backlight state, so the middle mode
+listens for the shake that lights the screen (`accel_tap_service_subscribe`) and
+holds the hand up for `BACKLIGHT_WINDOW_MS`, defined in `src/c/myproject.c`.
+Adjust that constant if your backlight timeout is set longer than the default.
+
+The chosen mode is persisted on the watch, so it survives a restart and applies
+before the phone connects.
+
 ## Building & running
 
 ### With the local SDK
