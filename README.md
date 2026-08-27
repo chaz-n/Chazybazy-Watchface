@@ -12,13 +12,24 @@ the Pebble mobile app. It offers one choice, the second hand:
 | Mode | Behaviour | Cost |
 | --- | --- | --- |
 | **Always on** (default) | The second hand sweeps continuously. | The watch wakes every second and animates at 30fps. |
-| **Only when the backlight is on** | The hand appears on a wrist flick and hides again after five seconds. | Per-second wakes only during those few seconds; the accelerometer stays on. |
+| **Only when the backlight is on** | The hand fades in and out with the backlight. | Per-second wakes only while the screen is lit. |
 | **Off** | No second hand. | The face wakes once a minute. |
 
-The SDK gives a watchface no way to read backlight state, so the middle mode
-listens for the shake that lights the screen (`accel_tap_service_subscribe`) and
-holds the hand up for `BACKLIGHT_WINDOW_MS`, defined in `src/c/myproject.c`.
-Adjust that constant if your backlight timeout is set longer than the default.
+The middle mode uses `backlight_service_subscribe`, which reports one edge each
+time the backlight turns on or off, whatever lit it — a wrist flick, a double
+tap, or coming back from the menu. Because only edges are reported, the mode
+seeds itself from `light_is_on()` when it starts, since the screen is usually
+already lit when the watchface launches or the setting changes.
+
+Nothing needs tuning: the hand follows your own backlight timeout rather than a
+guess at it, and no extra sensor is powered to work out when the screen is lit.
+
+The hand dissolves over `SECOND_FADE_DURATION` rather than snapping. Line
+drawing treats the stroke alpha as all-or-nothing on this hardware — alpha 2
+renders identically to alpha 3, alpha 1 not at all — so the hand cannot be
+blended over the dial. It is faded by ramping its colour toward the black
+background instead, which on a 64-colour display gives four steps per channel.
+Per-second ticking stops only once the hand has finished fading out.
 
 The chosen mode is persisted on the watch, so it survives a restart and applies
 before the phone connects.

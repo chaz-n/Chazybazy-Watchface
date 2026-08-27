@@ -4,8 +4,9 @@
 #define TICK_MAJOR 12
 #define NUMERAL_INSET 16
 #define HAND_MARGIN_MINUTE 14
-#define HAND_MARGIN_HOUR 46
 #define HAND_MARGIN_SECOND 8
+// The hour hand as a share of the minute hand, the usual analog proportion.
+#define HOUR_HAND_PERCENT 62
 #define HAND_TAIL 20
 
 #define DATE_PADDING_X 7
@@ -15,8 +16,13 @@
 // on screen for Gothic 24 Bold: 12px of slack above, 2px below.
 #define DATE_TEXT_LIFT 5
 
-#define SECOND_ANIM_DURATION 500
+// Half a second of bounce per second of clock was the face's biggest running
+// cost: it renders at the full frame rate for as long as it lasts. A quarter
+// second keeps the sweep and halves the frames.
+#define SECOND_ANIM_DURATION 250
 #define MINUTE_ANIM_DURATION 500
+#define SECOND_FADE_DURATION 350
+#define INTRO_DURATION 900
 
 // The second hand is the only expensive thing on this face: drawing it means a
 // SECOND_UNIT tick plus a 30fps bounce every second, where the rest of the dial
@@ -30,14 +36,19 @@ typedef enum {
 #define SECOND_MODE_DEFAULT SecondHandModeAlways
 #define PERSIST_KEY_SECOND_MODE 1
 
-// A watchface is never told whether the backlight is lit, so the shake that
-// lights it is what we listen for instead, and the hand stays up for roughly as
-// long as the backlight does.
-#define BACKLIGHT_WINDOW_MS 5000
-
 static Window *s_window;
 static Layer *s_face_layer;
 static char s_date_buffer[12];
+
+// The dial -- ticks, numerals and the date window -- is the same picture from
+// one frame to the next, and re-rendering it was most of the cost of a frame:
+// 60 ticks at a 5px and 2px stroke, and thick lines are expensive to draw. So
+// it is rendered once into a bitmap and blitted from then on, and only
+// re-rendered when the date changes or the layer is resized. That also takes
+// the per-frame text measurement and the 120 dial-point computations off the
+// hot path, since they only run on a re-render.
+static GBitmap *s_dial_cache;
+static bool s_dial_valid;
 
 // Dial geometry, recomputed from the layer bounds on each draw.
 static GPoint s_center;
@@ -53,10 +64,24 @@ static Animation *s_second_anim;
 // drives both.
 static Animation *s_minute_anim;
 
-// Whether the second hand is on screen right now. In backlight mode this goes
-// up and down with the wrist; in the other two modes it is fixed.
+// The sweep the hands make when the face loads: they run up from 12 to the
+// current time instead of appearing already in place. It drives all three
+// angles, so nothing else may move a hand while it is running.
+static Animation *s_intro_anim;
+static bool s_intro_running;
+
+// Whether the second hand should be on screen. In backlight mode this follows
+// the backlight; in the other two modes it is fixed.
 static bool s_second_visible = true;
-static AppTimer *s_backlight_timer;
+// How far the hand has faded in: 0 is fully out (not drawn), _MAX fully in.
+// The hand is only really gone, and per-second ticking only really stops, once
+// this reaches 0.
+static int32_t s_second_fade = 0;
+static int32_t s_fade_from, s_fade_to;
+static Animation *s_fade_anim;
+// Tri-state: -1 until the first subscription, so the initial mode always
+// subscribes whichever rate it needs.
+static int8_t s_ticking_per_second = -1;
 
 static const char *const s_numerals[] = {
   "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"
@@ -160,20 +185,30 @@ static void prv_draw_date(GContext *ctx) {
                      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 }
 
-// Draws a hand from a short tail behind the center out to `margin` pixels short
-// of the dial edge, so hands reach further toward the corners of a rectangular
-// display than toward its sides. A hand given `fixed_radius` instead sweeps a
-// true circle, keeping one length all the way round.
-static void prv_draw_hand(GContext *ctx, int32_t angle, int16_t margin, uint8_t width,
-                          GColor color, bool fixed_radius) {
-  const GPoint tip = fixed_radius
-      ? (GPoint) {
-          .x = s_center.x + (int16_t)(sin_lookup(angle) * (prv_min_radius() - margin)
-                                      / TRIG_MAX_RATIO),
-          .y = s_center.y - (int16_t)(cos_lookup(angle) * (prv_min_radius() - margin)
-                                      / TRIG_MAX_RATIO),
-        }
-      : prv_dial_point(margin, angle);
+// Hand lengths are measured from the center, not in from the dial edge: the
+// dial edge is the screen rectangle, so a hand inset from it would stretch
+// toward the corners and shrink toward the sides as it went round. Every hand
+// sweeps a true circle instead, keeping one length all the way round.
+static int16_t prv_minute_radius(void) {
+  return prv_min_radius() - HAND_MARGIN_MINUTE;
+}
+
+static int16_t prv_hour_radius(void) {
+  return prv_minute_radius() * HOUR_HAND_PERCENT / 100;
+}
+
+static int16_t prv_second_radius(void) {
+  return prv_min_radius() - HAND_MARGIN_SECOND;
+}
+
+// Draws a hand from a short tail behind the center out to `radius` pixels from
+// it.
+static void prv_draw_hand(GContext *ctx, int32_t angle, int16_t radius, uint8_t width,
+                          GColor color) {
+  const GPoint tip = {
+    .x = s_center.x + (int16_t)(sin_lookup(angle) * radius / TRIG_MAX_RATIO),
+    .y = s_center.y - (int16_t)(cos_lookup(angle) * radius / TRIG_MAX_RATIO),
+  };
   const GPoint tail = {
     .x = s_center.x - (int16_t)(sin_lookup(angle) * HAND_TAIL / TRIG_MAX_RATIO),
     .y = s_center.y + (int16_t)(cos_lookup(angle) * HAND_TAIL / TRIG_MAX_RATIO),
@@ -184,25 +219,120 @@ static void prv_draw_hand(GContext *ctx, int32_t angle, int16_t margin, uint8_t 
   graphics_draw_line(ctx, tail, tip);
 }
 
+// Line drawing treats the stroke alpha as all-or-nothing, so the hand cannot be
+// blended over the dial. It is faded by ramping its colour toward the black
+// background instead: four steps per channel on a 64-colour display, which over
+// a third of a second reads as a dissolve.
+static GColor prv_second_color(void) {
+  GColor color = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite);
+#if PBL_COLOR
+  // Rounded, so the ramp lands squarely on the endpoints rather than lingering
+  // one step above black.
+  const int32_t half = ANIMATION_NORMALIZED_MAX / 2;
+  color.r = (color.r * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
+  color.g = (color.g * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
+  color.b = (color.b * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
+#endif
+  return color;
+}
+
+static void prv_draw_dial(GContext *ctx, const GRect bounds) {
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  prv_draw_ticks(ctx);
+  prv_draw_numerals(ctx);
+  prv_draw_date(ctx);
+}
+
+static bool prv_dial_cache_fits(const GRect bounds) {
+  if (!s_dial_cache) {
+    return false;
+  }
+  const GSize size = gbitmap_get_bounds(s_dial_cache).size;
+  return size.w == bounds.size.w && size.h == bounds.size.h;
+}
+
+// Copies the dial that was just drawn out of the framebuffer and into the
+// cache. Row by row through the row info rather than one memcpy of the whole
+// buffer, because a round display stores each row at its own offset and only
+// the on-screen span of it is addressable.
+static void prv_capture_dial(GContext *ctx, const GRect bounds) {
+  if (!s_dial_cache) {
+    s_dial_cache = gbitmap_create_blank(bounds.size,
+                                        PBL_IF_COLOR_ELSE(GBitmapFormat8Bit, GBitmapFormat1Bit));
+    if (!s_dial_cache) {
+      return;  // No room for it: fall back to drawing the dial every frame.
+    }
+  }
+
+  GBitmap *fb = graphics_capture_frame_buffer(ctx);
+  if (!fb) {
+    return;
+  }
+  for (int y = 0; y < bounds.size.h; y++) {
+    const GBitmapDataRowInfo src = gbitmap_get_data_row_info(fb, y);
+    const GBitmapDataRowInfo dst = gbitmap_get_data_row_info(s_dial_cache, y);
+    const int16_t min_x = src.min_x > dst.min_x ? src.min_x : dst.min_x;
+    const int16_t max_x = src.max_x < dst.max_x ? src.max_x : dst.max_x;
+    if (max_x < min_x) {
+      continue;
+    }
+#if PBL_COLOR
+    memcpy(dst.data + min_x, src.data + min_x, max_x - min_x + 1);
+#else
+    // One byte to the pixel on colour, eight pixels to the byte here.
+    const int16_t first = min_x / 8;
+    const int16_t last = max_x / 8;
+    memcpy(dst.data + first, src.data + first, last - first + 1);
+#endif
+  }
+  graphics_release_frame_buffer(ctx, fb);
+  s_dial_valid = true;
+}
+
+static int s_dbg_frames, s_dbg_busy_us;
+static time_t s_dbg_win;
+
+static uint32_t prv_dbg_now_us(void) {
+  time_t s; uint16_t ms; time_ms(&s, &ms);
+  return (uint32_t)(s % 60) * 1000000 + (uint32_t)ms * 1000;
+}
+
 static void prv_face_update_proc(Layer *layer, GContext *ctx) {
+  const uint32_t dbg_t0 = prv_dbg_now_us();
   const GRect bounds = layer_get_bounds(layer);
   s_center = grect_center_point(&bounds);
   s_rx = bounds.size.w / 2 - 1;
   s_ry = bounds.size.h / 2 - 1;
 
   graphics_context_set_antialiased(ctx, true);
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  prv_draw_ticks(ctx);
-  prv_draw_numerals(ctx);
+  // The face layer is the whole window, so cache rows and framebuffer rows are
+  // the same rows.
+  if (!prv_dial_cache_fits(bounds)) {
+    if (s_dial_cache) {
+      gbitmap_destroy(s_dial_cache);
+      s_dial_cache = NULL;
+    }
+    s_dial_valid = false;
+  }
 
-  prv_draw_date(ctx);
-  prv_draw_hand(ctx, s_hour_angle, HAND_MARGIN_HOUR, 9, GColorWhite, false);
-  prv_draw_hand(ctx, s_minute_angle, HAND_MARGIN_MINUTE, 7, GColorWhite, false);
-  if (s_second_visible) {
-    prv_draw_hand(ctx, s_second_angle, HAND_MARGIN_SECOND, 2,
-                  PBL_IF_COLOR_ELSE(GColorRed, GColorWhite), true);
+  if (s_dial_valid) {
+    graphics_context_set_compositing_mode(ctx, GCompOpAssign);
+    graphics_draw_bitmap_in_rect(ctx, s_dial_cache, bounds);
+  } else {
+    prv_draw_dial(ctx, bounds);
+    prv_capture_dial(ctx, bounds);
+  }
+  prv_draw_hand(ctx, s_hour_angle, prv_hour_radius(), 9, GColorWhite);
+  prv_draw_hand(ctx, s_minute_angle, prv_minute_radius(), 7, GColorWhite);
+  // The bottom of the ramp rounds to the dial's own black. Drawing that would
+  // be invisible against the dial but a solid black stroke across the date
+  // window and the numerals, so it is skipped instead.
+  const GColor second_color = prv_second_color();
+  if (s_second_fade > 0 && !gcolor_equal(second_color, GColorBlack)) {
+    prv_draw_hand(ctx, s_second_angle, prv_second_radius(), 2, second_color);
   }
 
   // Center cap
@@ -210,6 +340,16 @@ static void prv_face_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_circle(ctx, s_center, 6);
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_circle(ctx, s_center, 2);
+
+  s_dbg_frames++;
+  s_dbg_busy_us += (int)(prv_dbg_now_us() - dbg_t0);
+  time_t dbg_now = time(NULL);
+  if (s_dbg_win == 0) { s_dbg_win = dbg_now; }
+  if (dbg_now - s_dbg_win >= 5) {
+    APP_LOG(APP_LOG_LEVEL_INFO, "DBG frames=%d over %ds busy_ms=%d",
+            s_dbg_frames, (int)(dbg_now - s_dbg_win), s_dbg_busy_us / 1000);
+    s_dbg_frames = 0; s_dbg_busy_us = 0; s_dbg_win = dbg_now;
+  }
 }
 
 // The bounce, in two stages. The animation service runs at 30fps, so a
@@ -252,25 +392,71 @@ static void prv_minute_update(Animation *anim, const AnimationProgress progress)
   layer_mark_dirty(s_face_layer);
 }
 
+// The sweep moves all three hands off one progress, from 12 to the time they
+// settle on.
+static void prv_intro_update(Animation *anim, const AnimationProgress progress) {
+  s_second_angle = prv_lerp(s_second_from, s_second_to, progress);
+  s_minute_angle = prv_lerp(s_minute_from, s_minute_to, progress);
+  s_hour_angle = prv_lerp(s_hour_from, s_hour_to, progress);
+  layer_mark_dirty(s_face_layer);
+}
+
+static void prv_intro_stopped(Animation *anim, bool finished, void *context) {
+  s_intro_running = false;
+}
+
 static const AnimationImplementation s_second_impl = {
   .update = prv_second_update,
 };
+
+static const AnimationImplementation s_intro_impl = {
+  .update = prv_intro_update,
+};
+
+static const AnimationHandlers s_intro_handlers = {
+  .stopped = prv_intro_stopped,
+};
+
+// Defined below, with the tick handler it subscribes.
+static void prv_sync_tick_rate(void);
+
+static void prv_fade_update(Animation *anim, const AnimationProgress progress) {
+  s_second_fade = prv_lerp(s_fade_from, s_fade_to, progress);
+  // The tick rate is part of the fade: per-second wakes stop only once the hand
+  // has finished fading out, and resume the moment it starts fading in.
+  prv_sync_tick_rate();
+  layer_mark_dirty(s_face_layer);
+}
 
 static const AnimationImplementation s_minute_impl = {
   .update = prv_minute_update,
 };
 
+static const AnimationImplementation s_fade_impl = {
+  .update = prv_fade_update,
+};
+
 // Replaces whatever is in `slot`, so a tick arriving mid-bounce restarts that
-// hand cleanly rather than leaking the old animation.
+// hand cleanly rather than leaking the old animation. `custom` wins over
+// `curve` when given; the fade and the sweep want stock curves, since the
+// bounce would overshoot past fully opaque and back below transparent.
 static void prv_schedule(Animation **slot, const AnimationImplementation *impl,
-                         uint32_t duration) {
+                         uint32_t duration, AnimationCurve curve,
+                         AnimationCurveFunction custom, const AnimationHandlers *handlers) {
   if (*slot) {
     animation_unschedule(*slot);
     animation_destroy(*slot);
   }
   *slot = animation_create();
   animation_set_duration(*slot, duration);
-  animation_set_custom_curve(*slot, prv_bounce_curve);
+  if (custom) {
+    animation_set_custom_curve(*slot, custom);
+  } else {
+    animation_set_curve(*slot, curve);
+  }
+  if (handlers) {
+    animation_set_handlers(*slot, *handlers, NULL);
+  }
   animation_set_implementation(*slot, impl);
   animation_schedule(*slot);
 }
@@ -280,7 +466,8 @@ static void prv_animate_second(int seconds) {
   s_second_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * seconds / 60;
   s_second_from = s_second_to - TRIG_MAX_ANGLE / 60;
 
-  prv_schedule(&s_second_anim, &s_second_impl, SECOND_ANIM_DURATION);
+  prv_schedule(&s_second_anim, &s_second_impl, SECOND_ANIM_DURATION,
+               AnimationCurveEaseInOut, prv_bounce_curve, NULL);
 }
 
 static void prv_animate_minute(int hours, int minutes) {
@@ -290,11 +477,38 @@ static void prv_animate_minute(int hours, int minutes) {
   s_hour_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * ((hours % 12) * 60 + minutes) / (12 * 60);
   s_hour_from = s_hour_to - TRIG_MAX_ANGLE / (12 * 60);
 
-  prv_schedule(&s_minute_anim, &s_minute_impl, MINUTE_ANIM_DURATION);
+  prv_schedule(&s_minute_anim, &s_minute_impl, MINUTE_ANIM_DURATION,
+               AnimationCurveEaseInOut, prv_bounce_curve, NULL);
+}
+
+// Where the three hands are heading, all starting from 12 o'clock. Called
+// again on a tick mid-sweep, so a minute turning over during the sweep moves
+// the target rather than starting a second animation on top of it.
+static void prv_set_intro_targets(const struct tm *t) {
+  s_second_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_sec / 60;
+  s_minute_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_min / 60;
+  s_hour_to = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * ((t->tm_hour % 12) * 60 + t->tm_min) / (12 * 60);
+  s_second_from = TRIG_MAX_ANGLE;
+  s_minute_from = TRIG_MAX_ANGLE;
+  s_hour_from = TRIG_MAX_ANGLE;
+}
+
+static void prv_start_intro(const struct tm *t) {
+  prv_set_intro_targets(t);
+  s_second_angle = TRIG_MAX_ANGLE;
+  s_minute_angle = TRIG_MAX_ANGLE;
+  s_hour_angle = TRIG_MAX_ANGLE;
+  s_intro_running = true;
+  // Eased out, not bounced: a sweep of most of a turn would overshoot by a
+  // visible margin and read as the hand missing its mark.
+  prv_schedule(&s_intro_anim, &s_intro_impl, INTRO_DURATION, AnimationCurveEaseOut,
+               NULL, &s_intro_handlers);
 }
 
 static void prv_update_date(const struct tm *t) {
   strftime(s_date_buffer, sizeof(s_date_buffer), "%a %d", t);
+  // The date window is part of the cached dial, so a new date means a redraw.
+  s_dial_valid = false;
   // Dial text reads better in caps.
   for (char *c = s_date_buffer; *c; c++) {
     if (*c >= 'a' && *c <= 'z') {
@@ -307,10 +521,14 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   if (units_changed & DAY_UNIT) {
     prv_update_date(tick_time);
   }
+  if (s_intro_running) {
+    prv_set_intro_targets(tick_time);
+    return;
+  }
   if (units_changed & MINUTE_UNIT) {
     prv_animate_minute(tick_time->tm_hour, tick_time->tm_min);
   }
-  if (s_second_visible) {
+  if (s_second_fade > 0) {
     prv_animate_second(tick_time->tm_sec);
   }
 }
@@ -323,56 +541,79 @@ static void prv_sync_second_angle(void) {
   s_second_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_sec / 60;
 }
 
-// Shows or hides the second hand, moving the tick subscription with it: the
-// watch is only woken every second while the hand is actually on screen.
-static void prv_set_second_visible(bool visible) {
+// Moves the tick subscription to match whether the hand is on screen at all,
+// fade included. Idempotent, so the fade can call it every frame.
+static void prv_sync_tick_rate(void) {
+  // A fade that has been scheduled but not yet run its first frame is already
+  // a hand on its way in, so it counts as on screen.
+  const bool fading_in = s_fade_anim && animation_is_scheduled(s_fade_anim) && s_fade_to > 0;
+  const int8_t per_second = (s_second_fade > 0 || fading_in) ? 1 : 0;
+  if (per_second == s_ticking_per_second) {
+    return;
+  }
+  s_ticking_per_second = per_second;
+  tick_timer_service_subscribe(per_second ? SECOND_UNIT : MINUTE_UNIT, prv_tick_handler);
+  if (!per_second && s_second_anim) {
+    animation_unschedule(s_second_anim);
+  }
+}
+
+// Shows or hides the second hand. `animated` dissolves it, which is what a
+// backlight transition wants; otherwise it snaps, which is what setting the
+// initial state and changing the setting want.
+static void prv_set_second_visible(bool visible, bool animated) {
   s_second_visible = visible;
 
-  if (visible) {
+  // The sweep owns the angle until it lands; snapping the hand to the live
+  // second here is what made it jump as it came in.
+  if (visible && !s_intro_running) {
     prv_sync_second_angle();
-    tick_timer_service_subscribe(SECOND_UNIT, prv_tick_handler);
-  } else {
-    tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
-    if (s_second_anim) {
-      animation_unschedule(s_second_anim);
-    }
   }
+
+  // Likewise, a snap mid-sweep would flash the hand on at full strength, so
+  // while the face is loading in every change dissolves.
+  if (animated || s_intro_running) {
+    s_fade_from = s_second_fade;
+    s_fade_to = visible ? ANIMATION_NORMALIZED_MAX : 0;
+    prv_schedule(&s_fade_anim, &s_fade_impl, SECOND_FADE_DURATION,
+                 AnimationCurveEaseInOut, NULL, NULL);
+    // Fading in has to raise the tick rate up front; fading out lowers it from
+    // prv_fade_update once the hand is actually gone.
+    prv_sync_tick_rate();
+    return;
+  }
+
+  if (s_fade_anim) {
+    animation_unschedule(s_fade_anim);
+  }
+  s_second_fade = visible ? ANIMATION_NORMALIZED_MAX : 0;
+  prv_sync_tick_rate();
   layer_mark_dirty(s_face_layer);
 }
 
-static void prv_backlight_timeout(void *context) {
-  s_backlight_timer = NULL;
-  prv_set_second_visible(false);
-}
-
-// A flick of the wrist is what lights the backlight, so it is also what brings
-// the second hand up. Another flick before the window is out just extends it.
-static void prv_tap_handler(AccelAxisType axis, int32_t direction) {
-  if (!s_second_visible) {
-    prv_set_second_visible(true);
-  }
-  if (s_backlight_timer) {
-    app_timer_reschedule(s_backlight_timer, BACKLIGHT_WINDOW_MS);
-  } else {
-    s_backlight_timer = app_timer_register(BACKLIGHT_WINDOW_MS, prv_backlight_timeout, NULL);
+// The backlight service reports the real thing, one edge per wake, however the
+// screen was lit -- wrist flick, double tap, or coming back from the menu. So
+// the hand simply tracks it, and follows the user's own backlight timeout
+// rather than a guess at it.
+static void prv_backlight_handler(bool on) {
+  if (on != s_second_visible) {
+    prv_set_second_visible(on, true);
   }
 }
 
 // Applies a mode from scratch: tears down whatever the last one had running,
 // then subscribes only to what this one needs. Safe to call repeatedly.
 static void prv_apply_second_mode(SecondHandMode mode) {
-  if (s_backlight_timer) {
-    app_timer_cancel(s_backlight_timer);
-    s_backlight_timer = NULL;
-  }
-  // The accelerometer costs power of its own, so it is only on in the one mode
-  // that reads it.
-  accel_tap_service_unsubscribe();
-  if (mode == SecondHandModeBacklight) {
-    accel_tap_service_subscribe(prv_tap_handler);
-  }
+  backlight_service_unsubscribe();
 
-  prv_set_second_visible(mode == SecondHandModeAlways);
+  if (mode == SecondHandModeBacklight) {
+    backlight_service_subscribe(prv_backlight_handler);
+    // Only edges are reported, so seed from the current state: the screen is
+    // usually already lit when the face is launched or the setting changes.
+    prv_set_second_visible(light_is_on(), false);
+  } else {
+    prv_set_second_visible(mode == SecondHandModeAlways, false);
+  }
 }
 
 static void prv_window_load(Window *window) {
@@ -387,10 +628,9 @@ static void prv_window_load(Window *window) {
   const time_t now = time(NULL);
   const struct tm *t = localtime(&now);
   prv_update_date(t);
-  // Start settled on the current time; the animations take over from the next tick.
-  s_second_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_sec / 60;
-  s_minute_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * t->tm_min / 60;
-  s_hour_angle = TRIG_MAX_ANGLE + TRIG_MAX_ANGLE * ((t->tm_hour % 12) * 60 + t->tm_min) / (12 * 60);
+  // Sweep up from 12 to the current time; the per-tick animations take over
+  // once the sweep lands.
+  prv_start_intro(t);
 }
 
 static void prv_window_unload(Window *window) {
@@ -403,6 +643,20 @@ static void prv_window_unload(Window *window) {
     animation_destroy(s_minute_anim);
     s_minute_anim = NULL;
   }
+  if (s_fade_anim) {
+    animation_destroy(s_fade_anim);
+    s_fade_anim = NULL;
+  }
+  if (s_intro_anim) {
+    animation_destroy(s_intro_anim);
+    s_intro_anim = NULL;
+  }
+  s_intro_running = false;
+  if (s_dial_cache) {
+    gbitmap_destroy(s_dial_cache);
+    s_dial_cache = NULL;
+  }
+  s_dial_valid = false;
   layer_destroy(s_face_layer);
 }
 
@@ -460,11 +714,7 @@ static void prv_init(void) {
 }
 
 static void prv_deinit(void) {
-  if (s_backlight_timer) {
-    app_timer_cancel(s_backlight_timer);
-    s_backlight_timer = NULL;
-  }
-  accel_tap_service_unsubscribe();
+  backlight_service_unsubscribe();
   tick_timer_service_unsubscribe();
   window_destroy(s_window);
 }
