@@ -21,10 +21,96 @@
       "watchface": true
     },
     "messageKeys": [
-      "SecondHandMode"
+      "SecondHandMode",
+      "NumeralFont",
+      "NumeralSize",
+      "ColorBackground",
+      "ColorNumerals",
+      "ColorTickMajor",
+      "ColorTickMinor",
+      "ColorHourHand",
+      "ColorMinuteHand",
+      "ColorSecondHand",
+      "ColorCenterCap",
+      "ColorDateText",
+      "ColorDateFill",
+      "ColorDateBorder"
     ],
     "resources": {
-      "media": []
+      "media": [
+        {
+          "type": "font",
+          "name": "SANS_24",
+          "file": "fonts/Ubuntu-B.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "SANS_28",
+          "file": "fonts/Ubuntu-B.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "SANS_34",
+          "file": "fonts/Ubuntu-B.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "SERIF_24",
+          "file": "fonts/SourceSerif4Display-Bold.otf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "SERIF_28",
+          "file": "fonts/SourceSerif4Display-Bold.otf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "SERIF_34",
+          "file": "fonts/SourceSerif4Display-Bold.otf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "CONDENSED_26",
+          "file": "fonts/Ubuntu-C.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "CONDENSED_32",
+          "file": "fonts/Ubuntu-C.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "CONDENSED_38",
+          "file": "fonts/Ubuntu-C.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "MONO_22",
+          "file": "fonts/Hack-Bold.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "MONO_26",
+          "file": "fonts/Hack-Bold.ttf",
+          "characterRegex": "[0-9]"
+        },
+        {
+          "type": "font",
+          "name": "MONO_30",
+          "file": "fonts/Hack-Bold.ttf",
+          "characterRegex": "[0-9]"
+        }
+      ]
     }
   }
 }

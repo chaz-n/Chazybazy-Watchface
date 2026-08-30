@@ -2,7 +2,89 @@
 
 #define TICK_MINOR 6
 #define TICK_MAJOR 12
-#define NUMERAL_INSET 16
+// The numerals. Each one is measured and placed exactly rather than fitted to
+// a hardcoded box, which is what lets the font be swapped from the settings
+// without redoing the layout. Measuring is only affordable because the dial is
+// rendered once and cached, not drawn every frame.
+typedef enum {
+  NumeralFontSans = 0,
+  NumeralFontSerif = 1,
+  NumeralFontCondensed = 2,
+  NumeralFontMono = 3,
+  NumeralFontGothic = 4,
+  NumeralFontBitham = 5,
+  NumeralFontLeco = 6,
+  NumeralFontDroidSerif = 7,
+  NumeralFontCount,
+} NumeralFont;
+
+typedef enum {
+  NumeralSizeSmall = 0,
+  NumeralSizeMedium = 1,
+  NumeralSizeLarge = 2,
+  NumeralSizeCount,
+} NumeralSize;
+
+// `lift` is per font: fonts sit low in their line box by an amount that scales
+// with the face, and the API gives no way to ask how much, so each one is
+// nudged by an amount measured on screen. `inset` moves the ring of numerals in
+// from the dial edge. Counter-intuitively a bigger face often wants a *smaller*
+// inset: the numerals sit on the screen rectangle, so pushing them outward
+// along the top edge is what spreads 11, 12 and 1 apart.
+//
+// `system_key` names one of the faces built into the watch; when it is NULL the
+// face is one of the three bundled with the app and `resource_id` loads it.
+typedef struct {
+  const char *system_key;
+  uint32_t resource_id;
+  int8_t lift;
+  int8_t inset;
+} NumeralFontSpec;
+
+// Only Droid Serif has a single size in the system font set, so all three of
+// its entries are the same face.
+static const NumeralFontSpec s_numeral_fonts[NumeralFontCount][NumeralSizeCount] = {
+  [NumeralFontSans] = {
+    { NULL, RESOURCE_ID_SANS_24, 5, 14 },
+    { NULL, RESOURCE_ID_SANS_28, 6, 17 },
+    { NULL, RESOURCE_ID_SANS_34, 7, 16 },
+  },
+  [NumeralFontSerif] = {
+    { NULL, RESOURCE_ID_SERIF_24, 5, 14 },
+    { NULL, RESOURCE_ID_SERIF_28, 6, 17 },
+    { NULL, RESOURCE_ID_SERIF_34, 7, 20 },
+  },
+  [NumeralFontCondensed] = {
+    { NULL, RESOURCE_ID_CONDENSED_26, 5, 14 },
+    { NULL, RESOURCE_ID_CONDENSED_32, 6, 17 },
+    { NULL, RESOURCE_ID_CONDENSED_38, 8, 20 },
+  },
+  [NumeralFontMono] = {
+    { NULL, RESOURCE_ID_MONO_22, 4, 14 },
+    { NULL, RESOURCE_ID_MONO_26, 5, 17 },
+    { NULL, RESOURCE_ID_MONO_30, 6, 20 },
+  },
+  [NumeralFontGothic] = {
+    { FONT_KEY_GOTHIC_18_BOLD, 0, 4, 12 },
+    { FONT_KEY_GOTHIC_24_BOLD, 0, 5, 16 },
+    { FONT_KEY_GOTHIC_28_BOLD, 0, 6, 20 },
+  },
+  [NumeralFontBitham] = {
+    { FONT_KEY_BITHAM_30_BLACK, 0, 7, 20 },
+    { FONT_KEY_BITHAM_34_MEDIUM_NUMBERS, 0, 8, 24 },
+    { FONT_KEY_BITHAM_42_MEDIUM_NUMBERS, 0, 10, 22 },
+  },
+  [NumeralFontLeco] = {
+    { FONT_KEY_LECO_28_LIGHT_NUMBERS, 0, 6, 18 },
+    { FONT_KEY_LECO_32_BOLD_NUMBERS, 0, 7, 22 },
+    { FONT_KEY_LECO_36_BOLD_NUMBERS, 0, 9, 19 },
+  },
+  [NumeralFontDroidSerif] = {
+    { FONT_KEY_DROID_SERIF_28_BOLD, 0, 7, 20 },
+    { FONT_KEY_DROID_SERIF_28_BOLD, 0, 7, 20 },
+    { FONT_KEY_DROID_SERIF_28_BOLD, 0, 7, 20 },
+  },
+};
 #define HAND_MARGIN_MINUTE 14
 #define HAND_MARGIN_SECOND 8
 // The hour hand as a share of the minute hand, the usual analog proportion.
@@ -34,7 +116,66 @@ typedef enum {
 } SecondHandMode;
 
 #define SECOND_MODE_DEFAULT SecondHandModeAlways
+// Key 1 held nothing but the second-hand mode, before the rest of the face
+// became configurable. It is still read once, to carry that setting over.
 #define PERSIST_KEY_SECOND_MODE 1
+#define PERSIST_KEY_SETTINGS 2
+// Bumped whenever the struct below changes shape, so an older stored blob is
+// discarded rather than misread.
+#define SETTINGS_VERSION 2
+
+// Everything the settings page can change. Stored as one blob: a dozen
+// separate persist keys would be a dozen reads at launch, and they always
+// change together anyway.
+typedef struct {
+  uint8_t version;
+  uint8_t second_mode;
+  uint8_t numeral_font;
+  uint8_t numeral_size;
+
+  GColor background;
+  GColor numerals;
+  GColor tick_major;
+  GColor tick_minor;
+  GColor hour_hand;
+  GColor minute_hand;
+  GColor second_hand;
+  GColor center_cap;
+  GColor date_text;
+  GColor date_fill;
+  GColor date_border;
+} Settings;
+
+// The defaults are the face as it shipped.
+static Settings s_settings;
+
+static void prv_settings_set_defaults(void) {
+  s_settings = (Settings) {
+    .version = SETTINGS_VERSION,
+    .second_mode = SECOND_MODE_DEFAULT,
+    .numeral_font = NumeralFontGothic,
+    .numeral_size = NumeralSizeMedium,
+    .background = GColorBlack,
+    .numerals = GColorWhite,
+    .tick_major = PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite),
+    .tick_minor = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorWhite),
+    .hour_hand = GColorWhite,
+    .minute_hand = GColorWhite,
+    .second_hand = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite),
+    .center_cap = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite),
+    .date_text = GColorWhite,
+    .date_fill = GColorBlack,
+    .date_border = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorWhite),
+  };
+}
+
+static const NumeralFontSpec *prv_numeral_spec(void) {
+  const uint8_t font = s_settings.numeral_font < NumeralFontCount
+      ? s_settings.numeral_font : NumeralFontGothic;
+  const uint8_t size = s_settings.numeral_size < NumeralSizeCount
+      ? s_settings.numeral_size : NumeralSizeMedium;
+  return &s_numeral_fonts[font][size];
+}
 
 static Window *s_window;
 static Layer *s_face_layer;
@@ -133,27 +274,45 @@ static void prv_draw_ticks(GContext *ctx) {
     const int32_t angle = TRIG_MAX_ANGLE * i / 60;
     const int16_t length = major ? TICK_MAJOR : TICK_MINOR;
 
-    graphics_context_set_stroke_color(ctx, major ? PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite)
-                                                 : PBL_IF_COLOR_ELSE(GColorDarkGray, GColorWhite));
+    graphics_context_set_stroke_color(ctx, major ? s_settings.tick_major : s_settings.tick_minor);
     graphics_context_set_stroke_width(ctx, major ? 5 : 2);
     graphics_draw_line(ctx, prv_dial_point(length, angle), prv_dial_point(0, angle));
   }
 }
 
 static void prv_draw_numerals(GContext *ctx) {
-  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
-  graphics_context_set_text_color(ctx, GColorWhite);
+  const NumeralFontSpec *spec = prv_numeral_spec();
+  // A bundled font has to be loaded into the heap and released again. The dial
+  // is only rendered when something changes, so this happens a handful of times
+  // a day and the font never sits in memory between renders.
+  GFont loaded = NULL;
+  if (spec->system_key == NULL) {
+    loaded = fonts_load_custom_font(resource_get_handle(spec->resource_id));
+  }
+  // Only `loaded` is ever unloaded: if the bundled face could not be loaded the
+  // dial falls back to a system font, and system fonts are not ours to free.
+  GFont font = loaded ? loaded
+                      : fonts_get_system_font(spec->system_key ? spec->system_key
+                                                               : FONT_KEY_GOTHIC_24_BOLD);
+  graphics_context_set_text_color(ctx, s_settings.numerals);
 
   for (int i = 0; i < 12; i++) {
     if (i == 3) {
       continue;  // the date aperture sits here
     }
     const int32_t angle = TRIG_MAX_ANGLE * i / 12;
-    const GPoint p = prv_dial_point(NUMERAL_INSET + TICK_MAJOR, angle);
-    // Gothic 24 sits low in its line box, hence the extra lift on y.
-    const GRect box = GRect(p.x - 20, p.y - 19, 40, 30);
+    const GPoint p = prv_dial_point(spec->inset + TICK_MAJOR, angle);
+    const GSize text = graphics_text_layout_get_content_size(
+        s_numerals[i], font, GRect(0, 0, 80, 80), GTextOverflowModeWordWrap,
+        GTextAlignmentCenter);
+    const GRect box = GRect(p.x - text.w / 2, p.y - text.h / 2 - spec->lift,
+                            text.w, text.h);
     graphics_draw_text(ctx, s_numerals[i], font, box, GTextOverflowModeWordWrap,
                        GTextAlignmentCenter, NULL);
+  }
+
+  if (loaded) {
+    fonts_unload_custom_font(loaded);
   }
 }
 
@@ -172,13 +331,13 @@ static void prv_draw_date(GContext *ctx) {
   const int16_t h = text.h + DATE_PADDING_Y * 2;
   const GRect box = GRect(s_center.x + s_rx - 4 - w, s_center.y - h / 2, w, h);
 
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, s_settings.date_fill);
   graphics_fill_rect(ctx, box, 3, GCornersAll);
-  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorWhite));
+  graphics_context_set_stroke_color(ctx, s_settings.date_border);
   graphics_context_set_stroke_width(ctx, 1);
   graphics_draw_round_rect(ctx, box, 3);
 
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, s_settings.date_text);
   graphics_draw_text(ctx, s_date_buffer, font,
                      GRect(box.origin.x, box.origin.y + DATE_PADDING_Y - DATE_TEXT_LIFT,
                            w, text.h),
@@ -220,24 +379,30 @@ static void prv_draw_hand(GContext *ctx, int32_t angle, int16_t radius, uint8_t 
 }
 
 // Line drawing treats the stroke alpha as all-or-nothing, so the hand cannot be
-// blended over the dial. It is faded by ramping its colour toward the black
+// blended over the dial. It is faded by ramping its colour toward the
 // background instead: four steps per channel on a 64-colour display, which over
-// a third of a second reads as a dissolve.
+// a third of a second reads as a dissolve. The ramp runs to whatever the
+// background has been set to, not to black, or a light dial would fade the hand
+// through to a dark smudge.
 static GColor prv_second_color(void) {
-  GColor color = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite);
+  const GColor from = s_settings.background;
+  const GColor to = s_settings.second_hand;
 #if PBL_COLOR
+  GColor color = to;
   // Rounded, so the ramp lands squarely on the endpoints rather than lingering
-  // one step above black.
+  // one step short.
   const int32_t half = ANIMATION_NORMALIZED_MAX / 2;
-  color.r = (color.r * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
-  color.g = (color.g * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
-  color.b = (color.b * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
-#endif
+  color.r = from.r + (int32_t)((to.r - from.r) * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
+  color.g = from.g + (int32_t)((to.g - from.g) * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
+  color.b = from.b + (int32_t)((to.b - from.b) * s_second_fade + half) / ANIMATION_NORMALIZED_MAX;
   return color;
+#else
+  return s_second_fade > ANIMATION_NORMALIZED_MAX / 2 ? to : from;
+#endif
 }
 
 static void prv_draw_dial(GContext *ctx, const GRect bounds) {
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, s_settings.background);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   prv_draw_ticks(ctx);
@@ -316,20 +481,20 @@ static void prv_face_update_proc(Layer *layer, GContext *ctx) {
     prv_draw_dial(ctx, bounds);
     prv_capture_dial(ctx, bounds);
   }
-  prv_draw_hand(ctx, s_hour_angle, prv_hour_radius(), 9, GColorWhite);
-  prv_draw_hand(ctx, s_minute_angle, prv_minute_radius(), 7, GColorWhite);
-  // The bottom of the ramp rounds to the dial's own black. Drawing that would
-  // be invisible against the dial but a solid black stroke across the date
+  prv_draw_hand(ctx, s_hour_angle, prv_hour_radius(), 9, s_settings.hour_hand);
+  prv_draw_hand(ctx, s_minute_angle, prv_minute_radius(), 7, s_settings.minute_hand);
+  // The bottom of the ramp rounds to the dial's own background. Drawing that
+  // would be invisible against the dial but a solid stroke across the date
   // window and the numerals, so it is skipped instead.
   const GColor second_color = prv_second_color();
-  if (s_second_fade > 0 && !gcolor_equal(second_color, GColorBlack)) {
+  if (s_second_fade > 0 && !gcolor_equal(second_color, s_settings.background)) {
     prv_draw_hand(ctx, s_second_angle, prv_second_radius(), 2, second_color);
   }
 
   // Center cap
-  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorWhite));
+  graphics_context_set_fill_color(ctx, s_settings.center_cap);
   graphics_fill_circle(ctx, s_center, 6);
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, s_settings.background);
   graphics_fill_circle(ctx, s_center, 2);
 }
 
@@ -661,26 +826,85 @@ static SecondHandMode prv_clamp_mode(int32_t value) {
   return (SecondHandMode)value;
 }
 
-static void prv_inbox_received(DictionaryIterator *iter, void *context) {
-  const Tuple *t = dict_find(iter, MESSAGE_KEY_SecondHandMode);
+// Clay's colour picker sends a 24-bit RRGGBB integer, which is more colours
+// than the display has; GColorFromHEX quantises it to the nearest of the 64 the
+// watch can actually show.
+static void prv_read_color(DictionaryIterator *iter, uint32_t key, GColor *out) {
+  const Tuple *t = dict_find(iter, key);
+  if (t) {
+    *out = GColorFromHEX(prv_tuple_int(t));
+  }
+}
+
+static void prv_read_enum(DictionaryIterator *iter, uint32_t key, uint8_t *out, uint8_t count) {
+  const Tuple *t = dict_find(iter, key);
   if (!t) {
     return;
   }
-  const SecondHandMode mode = prv_clamp_mode(prv_tuple_int(t));
-  persist_write_int(PERSIST_KEY_SECOND_MODE, mode);
-  prv_apply_second_mode(mode);
+  const int32_t value = prv_tuple_int(t);
+  if (value >= 0 && value < count) {
+    *out = (uint8_t)value;
+  }
 }
 
-static SecondHandMode prv_load_second_mode(void) {
-  if (!persist_exists(PERSIST_KEY_SECOND_MODE)) {
-    return SECOND_MODE_DEFAULT;
+// A settings page save arrives as one message, but it need not carry every
+// key -- anything absent keeps the value it already had.
+static void prv_inbox_received(DictionaryIterator *iter, void *context) {
+  const uint8_t previous_mode = s_settings.second_mode;
+
+  const Tuple *mode = dict_find(iter, MESSAGE_KEY_SecondHandMode);
+  if (mode) {
+    s_settings.second_mode = prv_clamp_mode(prv_tuple_int(mode));
   }
-  return prv_clamp_mode(persist_read_int(PERSIST_KEY_SECOND_MODE));
+  prv_read_enum(iter, MESSAGE_KEY_NumeralFont, &s_settings.numeral_font, NumeralFontCount);
+  prv_read_enum(iter, MESSAGE_KEY_NumeralSize, &s_settings.numeral_size, NumeralSizeCount);
+
+  prv_read_color(iter, MESSAGE_KEY_ColorBackground, &s_settings.background);
+  prv_read_color(iter, MESSAGE_KEY_ColorNumerals, &s_settings.numerals);
+  prv_read_color(iter, MESSAGE_KEY_ColorTickMajor, &s_settings.tick_major);
+  prv_read_color(iter, MESSAGE_KEY_ColorTickMinor, &s_settings.tick_minor);
+  prv_read_color(iter, MESSAGE_KEY_ColorHourHand, &s_settings.hour_hand);
+  prv_read_color(iter, MESSAGE_KEY_ColorMinuteHand, &s_settings.minute_hand);
+  prv_read_color(iter, MESSAGE_KEY_ColorSecondHand, &s_settings.second_hand);
+  prv_read_color(iter, MESSAGE_KEY_ColorCenterCap, &s_settings.center_cap);
+  prv_read_color(iter, MESSAGE_KEY_ColorDateText, &s_settings.date_text);
+  prv_read_color(iter, MESSAGE_KEY_ColorDateFill, &s_settings.date_fill);
+  prv_read_color(iter, MESSAGE_KEY_ColorDateBorder, &s_settings.date_border);
+
+  persist_write_data(PERSIST_KEY_SETTINGS, &s_settings, sizeof(s_settings));
+
+  // The dial carries the colours and the numerals, so all of this changes the
+  // cached picture.
+  s_dial_valid = false;
+  window_set_background_color(s_window, s_settings.background);
+  if (s_settings.second_mode != previous_mode) {
+    prv_apply_second_mode(s_settings.second_mode);
+  }
+  layer_mark_dirty(s_face_layer);
+}
+
+static void prv_load_settings(void) {
+  prv_settings_set_defaults();
+
+  Settings stored;
+  const int read = persist_read_data(PERSIST_KEY_SETTINGS, &stored, sizeof(stored));
+  if (read == sizeof(stored) && stored.version == SETTINGS_VERSION) {
+    s_settings = stored;
+    return;
+  }
+
+  // Nothing stored in this shape. Carry over the one setting the face had
+  // before it was configurable, so an existing install keeps its second hand.
+  if (persist_exists(PERSIST_KEY_SECOND_MODE)) {
+    s_settings.second_mode = prv_clamp_mode(persist_read_int(PERSIST_KEY_SECOND_MODE));
+  }
 }
 
 static void prv_init(void) {
+  prv_load_settings();
+
   s_window = window_create();
-  window_set_background_color(s_window, GColorBlack);
+  window_set_background_color(s_window, s_settings.background);
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = prv_window_load,
     .unload = prv_window_unload,
@@ -688,10 +912,13 @@ static void prv_init(void) {
   window_stack_push(s_window, true);
 
   // Subscribes the tick service too, at whatever rate the mode calls for.
-  prv_apply_second_mode(prv_load_second_mode());
+  prv_apply_second_mode(s_settings.second_mode);
 
   app_message_register_inbox_received(prv_inbox_received);
-  app_message_open(64, 64);
+  // The settings page sends every key in one message, and 64 bytes only had
+  // room for a handful of them: anything larger was dropped before it reached
+  // the inbox handler. Sized for the whole page with room to grow.
+  app_message_open(512, 64);
 }
 
 static void prv_deinit(void) {
