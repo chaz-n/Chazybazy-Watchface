@@ -291,16 +291,7 @@ static void prv_capture_dial(GContext *ctx, const GRect bounds) {
   s_dial_valid = true;
 }
 
-static int s_dbg_frames, s_dbg_busy_us;
-static time_t s_dbg_win;
-
-static uint32_t prv_dbg_now_us(void) {
-  time_t s; uint16_t ms; time_ms(&s, &ms);
-  return (uint32_t)(s % 60) * 1000000 + (uint32_t)ms * 1000;
-}
-
 static void prv_face_update_proc(Layer *layer, GContext *ctx) {
-  const uint32_t dbg_t0 = prv_dbg_now_us();
   const GRect bounds = layer_get_bounds(layer);
   s_center = grect_center_point(&bounds);
   s_rx = bounds.size.w / 2 - 1;
@@ -340,16 +331,6 @@ static void prv_face_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_circle(ctx, s_center, 6);
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_circle(ctx, s_center, 2);
-
-  s_dbg_frames++;
-  s_dbg_busy_us += (int)(prv_dbg_now_us() - dbg_t0);
-  time_t dbg_now = time(NULL);
-  if (s_dbg_win == 0) { s_dbg_win = dbg_now; }
-  if (dbg_now - s_dbg_win >= 5) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "DBG frames=%d over %ds busy_ms=%d",
-            s_dbg_frames, (int)(dbg_now - s_dbg_win), s_dbg_busy_us / 1000);
-    s_dbg_frames = 0; s_dbg_busy_us = 0; s_dbg_win = dbg_now;
-  }
 }
 
 // The bounce, in two stages. The animation service runs at 30fps, so a
